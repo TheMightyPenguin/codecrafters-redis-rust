@@ -2,6 +2,7 @@
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
+    thread,
 };
 
 enum MessageType {
@@ -28,8 +29,10 @@ fn main() {
 
     for stream in listener.incoming() {
         match stream {
-            Ok(mut incoming_stream) => {
-                handle_stream(incoming_stream);
+            Ok(incoming_stream) => {
+                thread::spawn(move || {
+                    handle_stream(incoming_stream);
+                });
             }
             Err(e) => {
                 println!("error: {}", e);
