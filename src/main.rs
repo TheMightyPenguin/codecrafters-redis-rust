@@ -152,13 +152,13 @@ fn handle_client_message(message: String) -> Vec<Command> {
                     command_name = word.to_string();
                 }
 
-                match (command_name.as_str(), word) {
+                match (command_name.to_lowercase().as_str(), word) {
                     ("ping", _) => {
                         instructions.push(Command::Ping);
                         command_name = "".to_string();
                     }
 
-                    ("ECHO", arg) => {
+                    ("echo", arg) => {
                         if processing_command {
                             instructions.push(Command::Echo(arg.to_string()));
                             command_name = "".to_string();
@@ -168,7 +168,7 @@ fn handle_client_message(message: String) -> Vec<Command> {
                         }
                     }
 
-                    ("COMMAND", arg) => {
+                    ("command", arg) => {
                         if processing_command {
                             instructions.push(Command::Command(arg.to_string()));
                             command_name = "".to_string();
@@ -189,8 +189,6 @@ fn handle_client_message(message: String) -> Vec<Command> {
 
     instructions
 }
-
-fn handle_command(command_string: String) {}
 
 fn get_instruction_type(c: char) -> MessageType {
     match c {
