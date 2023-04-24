@@ -1,7 +1,9 @@
 // Uncomment this block to pass the first stagE
 use std::{
+    collections::HashMap,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
+    sync::{Arc, Mutex},
     thread,
 };
 
@@ -17,10 +19,13 @@ enum MessageType {
 enum Command {
     Echo(String),
     Command(String),
+    Get(String),
+    Set(String, String),
     Ping,
 }
 
 const SEPARATOR: &str = "\r\n";
+const NULL_BULK_STRING: &str = "$-1\r\n";
 
 fn format_message(kind: MessageType, body: String) -> String {
     let message = match kind {
@@ -35,12 +40,14 @@ fn format_message(kind: MessageType, body: String) -> String {
 
 fn main() {
     let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
+    let storage: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
 
     for stream in listener.incoming() {
+        let mut storage_for_thread = storage.clone();
         match stream {
             Ok(incoming_stream) => {
                 thread::spawn(move || {
-                    handle_stream(incoming_stream);
+                    handle_stream(incoming_stream, &mut storage_for_thread);
                 });
             }
             Err(e) => {
@@ -50,7 +57,7 @@ fn main() {
     }
 }
 
-fn handle_stream(mut stream: TcpStream) {
+fn handle_stream(mut stream: TcpStream, storage_ref: &mut Arc<Mutex<HashMap<String, String>>>) {
     loop {
         let mut buffer = [0 as u8; 1024];
         match stream.read(&mut buffer) {
@@ -84,10 +91,27 @@ fn handle_stream(mut stream: TcpStream) {
                         Command::Echo(message) => format_message(MessageType::BulkString, message),
 
                         Command::Command(command) => match command.as_str() {
-                            _ => {
-                                format_message(MessageType::SimpleString, "no docs yet".to_string())
-                            }
+                            _ => format_message(
+                                MessageType::SimpleString,
+                                "not supported yet".to_string(),
+                            ),
                         },
+
+                        Command::Get(key) => {
+                            let storage = storage_ref.lock().unwrap();
+                            match storage.get(&key) {
+                                Some(value) => {
+                                    format_message(MessageType::BulkString, value.to_string())
+                                }
+                                None => NULL_BULK_STRING.to_string(),
+                            }
+                        }
+
+                        Command::Set(key, value) => {
+                            let mut storage = storage_ref.lock().unwrap();
+                            storage.insert(key, value);
+                            format_message(MessageType::SimpleString, "OK".to_string())
+                        }
 
                         Command::Ping => {
                             format_message(MessageType::SimpleString, "PONG".to_string())
@@ -119,8 +143,9 @@ fn handle_client_message(message: String) -> Vec<Command> {
     let mut state = State::ReadingArray;
     let mut roller = CharRoller::from_string(message);
     let mut command_name = "".to_string();
+    let mut args: Vec<String> = vec![];
     let mut instructions: Vec<Command> = vec![];
-    let mut processing_command = false;
+    let mut items_left_count = 0;
 
     while let Some(raw_word) = roller.next_word() {
         let word = raw_word.trim();
@@ -130,8 +155,8 @@ fn handle_client_message(message: String) -> Vec<Command> {
                 if instruction_type != MessageType::Array {
                     panic!("expected array");
                 }
-                // let array_length = word[1..].parse::<usize>().unwrap();
-                // println!("array length: {}", array_length);
+                let array_length = word[1..].parse::<usize>().unwrap();
+                items_left_count = array_length;
                 state = State::ReadingBulkStringLength;
             }
 
@@ -140,45 +165,51 @@ fn handle_client_message(message: String) -> Vec<Command> {
                 if instruction_type != MessageType::BulkString {
                     panic!("expected bulk string");
                 }
-                // let string_length = word[1..].parse::<usize>().unwrap();
-                // println!("string length: {}", string_length);
                 state = State::ReadingBulkStringContent;
             }
 
             State::ReadingBulkStringContent => {
-                println!("content: {}", word);
-
                 if command_name.is_empty() {
                     command_name = word.to_string();
+                } else {
+                    args.push(word.to_string());
                 }
 
-                match (command_name.to_lowercase().as_str(), word) {
-                    ("ping", _) => {
+                if items_left_count != 1 {
+                    state = State::ReadingBulkStringLength;
+                    items_left_count = items_left_count - 1;
+                    continue;
+                }
+
+                match command_name.to_lowercase().as_str() {
+                    "ping" => {
                         instructions.push(Command::Ping);
                         command_name = "".to_string();
                     }
 
-                    ("echo", arg) => {
-                        if processing_command {
-                            instructions.push(Command::Echo(arg.to_string()));
-                            command_name = "".to_string();
-                            processing_command = false;
-                        } else {
-                            processing_command = true;
-                        }
+                    "echo" => {
+                        instructions.push(Command::Echo(args.join(" ").to_string()));
+                        command_name = "".to_string();
                     }
 
-                    ("command", arg) => {
-                        if processing_command {
-                            instructions.push(Command::Command(arg.to_string()));
-                            command_name = "".to_string();
-                            processing_command = false;
-                        } else {
-                            processing_command = true;
-                        }
+                    "get" => {
+                        println!("processing get: {} {}", command_name, args[0]);
+                        instructions.push(Command::Get(args[0].to_string()));
+                        command_name = "".to_string();
                     }
 
-                    (other, _) => {
+                    "set" => {
+                        println!("processing set: {} {:?}", command_name, args);
+                        instructions.push(Command::Set(args[0].to_string(), args[1].to_string()));
+                        command_name = "".to_string();
+                    }
+
+                    "command" => {
+                        instructions.push(Command::Command(args.join(" ").to_string()));
+                        command_name = "".to_string();
+                    }
+
+                    other => {
                         println!("unknown command: {}", other);
                     }
                 }
