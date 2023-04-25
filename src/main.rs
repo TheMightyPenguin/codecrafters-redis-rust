@@ -1,10 +1,10 @@
-// Uncomment this block to pass the first stagE
 use std::{
     collections::HashMap,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     sync::{Arc, Mutex},
     thread,
+    time::{Duration, Instant},
 };
 
 #[derive(PartialEq)]
@@ -20,8 +20,22 @@ enum Command {
     Echo(String),
     Command(String),
     Get(String),
-    Set(String, String),
+    Set(String, String, Option<u64>),
     Ping,
+}
+
+struct StorageEntry {
+    expire_timestamp: Option<Instant>,
+    value: String,
+}
+
+impl StorageEntry {
+    fn new(value: String, expire_timestamp: Option<Instant>) -> StorageEntry {
+        StorageEntry {
+            expire_timestamp,
+            value,
+        }
+    }
 }
 
 const SEPARATOR: &str = "\r\n";
@@ -40,7 +54,7 @@ fn format_message(kind: MessageType, body: String) -> String {
 
 fn main() {
     let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
-    let storage: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    let storage = Arc::new(Mutex::new(HashMap::<String, StorageEntry>::new()));
 
     for stream in listener.incoming() {
         let mut storage_for_thread = storage.clone();
@@ -57,7 +71,10 @@ fn main() {
     }
 }
 
-fn handle_stream(mut stream: TcpStream, storage_ref: &mut Arc<Mutex<HashMap<String, String>>>) {
+fn handle_stream(
+    mut stream: TcpStream,
+    storage_ref: &mut Arc<Mutex<HashMap<String, StorageEntry>>>,
+) {
     loop {
         let mut buffer = [0 as u8; 1024];
         match stream.read(&mut buffer) {
@@ -71,7 +88,7 @@ fn handle_stream(mut stream: TcpStream, storage_ref: &mut Arc<Mutex<HashMap<Stri
                     break;
                 }
 
-                println!("message: {:?}", message.clone().chars().collect::<Vec<_>>());
+                // println!("message: {:?}", message.clone().chars().collect::<Vec<_>>());
                 let instructions = handle_client_message(message);
 
                 if instructions.len() == 0 {
@@ -98,18 +115,37 @@ fn handle_stream(mut stream: TcpStream, storage_ref: &mut Arc<Mutex<HashMap<Stri
                         },
 
                         Command::Get(key) => {
-                            let storage = storage_ref.lock().unwrap();
+                            let mut storage = storage_ref.lock().unwrap();
                             match storage.get(&key) {
-                                Some(value) => {
-                                    format_message(MessageType::BulkString, value.to_string())
+                                Some(entry) => {
+                                    let now = Instant::now();
+                                    let expiry = entry
+                                        .expire_timestamp
+                                        .unwrap_or(now + Duration::from_secs(1));
+                                    if entry.expire_timestamp.is_some() && now > expiry {
+                                        storage.remove(&key);
+                                        NULL_BULK_STRING.to_string()
+                                    } else {
+                                        format_message(
+                                            MessageType::BulkString,
+                                            entry.value.to_string(),
+                                        )
+                                    }
                                 }
                                 None => NULL_BULK_STRING.to_string(),
                             }
                         }
 
-                        Command::Set(key, value) => {
+                        Command::Set(key, value, expiry) => {
                             let mut storage = storage_ref.lock().unwrap();
-                            storage.insert(key, value);
+                            let entry = StorageEntry::new(
+                                value,
+                                match expiry {
+                                    Some(ms) => Some(Instant::now() + Duration::from_millis(ms)),
+                                    None => None,
+                                },
+                            );
+                            storage.insert(key, entry);
                             format_message(MessageType::SimpleString, "OK".to_string())
                         }
 
@@ -117,10 +153,10 @@ fn handle_stream(mut stream: TcpStream, storage_ref: &mut Arc<Mutex<HashMap<Stri
                             format_message(MessageType::SimpleString, "PONG".to_string())
                         }
                     };
-                    println!(
-                        "sending-----> {:?}",
-                        message_to_send.chars().collect::<Vec<_>>()
-                    );
+                    // println!(
+                    //     "sending-----> {:?}",
+                    //     message_to_send.chars().collect::<Vec<_>>()
+                    // );
                     stream.write(message_to_send.as_bytes()).unwrap();
                 }
                 println!();
@@ -193,14 +229,29 @@ fn handle_client_message(message: String) -> Vec<Command> {
                     }
 
                     "get" => {
-                        println!("processing get: {} {}", command_name, args[0]);
                         instructions.push(Command::Get(args[0].to_string()));
                         command_name = "".to_string();
                     }
 
                     "set" => {
-                        println!("processing set: {} {:?}", command_name, args);
-                        instructions.push(Command::Set(args[0].to_string(), args[1].to_string()));
+                        let mut expiry: Option<u64> = None;
+                        if args.len() == 4 {
+                            expiry = match args[3].parse::<u64>() {
+                                Ok(expiry) => {
+                                    if expiry > 0 {
+                                        Some(expiry)
+                                    } else {
+                                        None
+                                    }
+                                }
+                                Err(_e) => None,
+                            }
+                        }
+                        instructions.push(Command::Set(
+                            args[0].to_string(),
+                            args[1].to_string(),
+                            expiry,
+                        ));
                         command_name = "".to_string();
                     }
 
